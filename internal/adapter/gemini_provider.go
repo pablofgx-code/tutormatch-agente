@@ -15,8 +15,9 @@ import (
 
 const (
 	defaultGeminiBaseURL = "https://generativelanguage.googleapis.com/v1beta/models"
-	defaultGeminiModel   = "gemini-3.8-flash"
+	defaultGeminiModel   = "gemini-flash-lite-latest"
 	defaultGeminiTimeout = 90 * time.Second
+	defaultThinkingLevel = "LOW"
 )
 
 const systemPromptTutorMatch = `Eres el asistente de tutorías universitarias de TutorMatch.
@@ -30,8 +31,8 @@ Catálogo de códigos de ramos conocidos:
 
 Reglas estrictas:
 1. Usa siempre las herramientas disponibles para consultar tutores, horarios o generar quizzes; nunca inventes tutores ni horarios.
-2. Cuando un estudiante pida ayuda con un ramo y un día/horario, primero busca tutores con buscar_tutores y luego consulta la disponibilidad de esos tutores con ver_disponibilidad.
-3. Propón las opciones claras al estudiante y ejecuta crear_reserva ÚNICAMENTE cuando el estudiante haya confirmado el tutor y el horario.`
+2. Cuando un estudiante pida ayuda con un ramo y un día/horario, primero busca tutores con buscar_tutores y luego consulta la disponibilidad de TODOS los tutores encontrados usando ver_disponibilidad.
+3. Propón todas las opciones disponibles al estudiante y ejecuta crear_reserva ÚNICAMENTE cuando el estudiante haya confirmado el tutor y el horario.`
 
 // GeminiProvider implementa domain.LLMProvider conectándose a Google Gemini en la nube.
 type GeminiProvider struct {
@@ -65,9 +66,18 @@ func (p *GeminiProvider) WithBaseURL(url string) *GeminiProvider {
 // --- Estructuras del protocolo REST de Gemini ---
 
 type geminiRequest struct {
-	SystemInstruction *geminiContent  `json:"systemInstruction,omitempty"`
-	Contents          []geminiContent `json:"contents"`
-	Tools             []geminiToolSet `json:"tools,omitempty"`
+	SystemInstruction *geminiContent       `json:"systemInstruction,omitempty"`
+	Contents          []geminiContent      `json:"contents"`
+	Tools             []geminiToolSet      `json:"tools,omitempty"`
+	GenerationConfig  *geminiGenerationCfg `json:"generationConfig,omitempty"`
+}
+
+type geminiGenerationCfg struct {
+	ThinkingConfig *geminiThinkingConfig `json:"thinkingConfig,omitempty"`
+}
+
+type geminiThinkingConfig struct {
+	ThinkingLevel string `json:"thinkingLevel,omitempty"`
 }
 
 type geminiContent struct {
@@ -124,6 +134,11 @@ func (p *GeminiProvider) GenerarTurno(ctx context.Context, mensajes []domain.Men
 		},
 		Contents: mapearHistorial(mensajes),
 		Tools:    mapearTools(tools),
+		GenerationConfig: &geminiGenerationCfg{
+			ThinkingConfig: &geminiThinkingConfig{
+				ThinkingLevel: defaultThinkingLevel,
+			},
+		},
 	}
 
 	payload, err := json.Marshal(reqBody)

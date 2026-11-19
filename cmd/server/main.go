@@ -20,7 +20,7 @@ import (
 func main() {
 	port := getEnv("PORT", "8080")
 	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
-	geminiModel := getEnv("GEMINI_MODEL", "gemini-3.8-flash")
+	geminiModel := getEnv("GEMINI_MODEL", "gemini-flash-lite-latest")
 	bffURL := os.Getenv("BFF_URL")
 
 	if geminiAPIKey == "" {
@@ -66,7 +66,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("Servidor MCP y Agente escuchando en el puerto %s", port)
+	log.Printf("Servidor MCP y Agente escuchando en el puerto %s (modelo IA: %s)", port, geminiModel)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("error iniciando servidor HTTP: %v", err)
 	}

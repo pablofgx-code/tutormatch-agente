@@ -1,0 +1,35 @@
+name: CI - TutorMatch Agente
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Análisis estático (go vet)
+        run: go vet ./...
+
+      - name: Compilar binario
+        run: go build -o bin/agente ./cmd/server/main.go
+
+      - name: Ejecutar tests con race detector y cobertura
+        run: go test -v -race -coverprofile=coverage.out ./internal/...
+
+      - name: Verificar umbral mínimo de cobertura (60%)
+        run: |
+          TOTAL=$(go tool cover -func=coverage.out | grep total: | awk '{print substr($3, 1, length($3)-1)}')
+          echo "Cobertura total: ${TOTAL}%"
+          awk -v cov="$TOTAL" 'BEGIN { if (cov < 60.0) { print "ERROR: cobertura menor al 60%"; exit 1 } }'

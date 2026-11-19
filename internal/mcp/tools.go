@@ -175,6 +175,11 @@ func (t *CrearReservaTool) Definition() domain.ToolDefinition {
 }
 
 func (t *CrearReservaTool) Execute(ctx context.Context, usuarioID string, args map[string]any) (any, error) {
+	usuarioID = strings.TrimSpace(usuarioID)
+	if usuarioID == "" {
+		return nil, fmt.Errorf("%w: falta el identificador del estudiante autenticado", domain.ErrArgumentoInvalido)
+	}
+
 	tutorID, err := extraerString(args, "tutor_id", true)
 	if err != nil {
 		return nil, err
