@@ -1,19 +1,52 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
-// ChatRequest representa el mensaje que envía el BFF al endpoint POST /agent/chat[cite: 6].
+// ChatRequest representa el mensaje que envía el BFF al endpoint POST /agent/chat.
 type ChatRequest struct {
-	UsuarioID string `json:"usuario_id"`
-	Mensaje   string `json:"mensaje"`
+	UsuarioID string        `json:"usuario_id"`
+	Mensaje   string        `json:"mensaje"`
+	Historial []MensajeChat `json:"historial,omitempty"`
 }
 
-// ChatResponse es la respuesta final redactada por el agente hacia el BFF[cite: 6].
+func (r ChatRequest) Validar() error {
+	if strings.TrimSpace(r.UsuarioID) == "" || strings.TrimSpace(r.Mensaje) == "" {
+		return ErrArgumentoInvalido
+	}
+	return nil
+}
+
+// ChatResponse es la respuesta final redactada por el agente hacia el BFF.
 type ChatResponse struct {
 	Respuesta string `json:"respuesta"`
 }
 
-// TutorResumen representa un tutor activo devuelto por la tool buscar_tutores[cite: 6].
+type RolMensaje string
+
+const (
+	RolUsuario     RolMensaje = "user"
+	RolModelo      RolMensaje = "model"
+	RolHerramienta RolMensaje = "tool"
+)
+
+// MensajeChat modela un turno agnóstico al proveedor de IA.
+type MensajeChat struct {
+	Rol        RolMensaje  `json:"rol"`
+	Texto      string      `json:"texto,omitempty"`
+	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+	ToolResult *ToolResult `json:"tool_result,omitempty"`
+}
+
+// ToolDefinition describe el contrato JSON Schema que consume tanto MCP como el LLM.
+type ToolDefinition struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
 type TutorResumen struct {
 	ID     string   `json:"id"`
 	Nombre string   `json:"nombre"`
@@ -21,7 +54,6 @@ type TutorResumen struct {
 	Ramos  []string `json:"ramos"`
 }
 
-// BloqueDisponibilidad representa un horario libre de un tutor en Sesiones[cite: 5, 6].
 type BloqueDisponibilidad struct {
 	ID      string `json:"id"`
 	TutorID string `json:"tutor_id"`
@@ -30,7 +62,6 @@ type BloqueDisponibilidad struct {
 	HoraFin string `json:"hora_fin"`
 }
 
-// ReservaCreada representa la sesión confirmada/pendiente creada en Sesiones[cite: 5, 6].
 type ReservaCreada struct {
 	SesionID     string    `json:"sesion_id"`
 	TutorID      string    `json:"tutor_id"`
@@ -40,11 +71,10 @@ type ReservaCreada struct {
 	CreadaEn     time.Time `json:"creada_en"`
 }
 
-// PreguntaQuiz y QuizResultado representan el quiz generado a partir del material[cite: 5, 6].
 type PreguntaQuiz struct {
-	Pregunta  string   `json:"pregunta"`
-	Opciones  []string `json:"opciones"`
-	Respuesta string   `json:"respuesta"`
+	Pregunta          string   `json:"pregunta"`
+	Opciones          []string `json:"opciones"`
+	RespuestaCorrecta string   `json:"respuesta_correcta"`
 }
 
 type QuizResultado struct {
@@ -52,20 +82,20 @@ type QuizResultado struct {
 	Preguntas  []PreguntaQuiz `json:"preguntas"`
 }
 
-// ToolCall y ToolResult modelan el intercambio de herramientas dentro del loop del agente[cite: 6].
 type ToolCall struct {
 	ID        string         `json:"id"`
 	Name      string         `json:"name"`
 	Arguments map[string]any `json:"arguments"`
+	Signature string         `json:"signature,omitempty"`
 }
 
 type ToolResult struct {
 	CallID  string `json:"call_id"`
 	Name    string `json:"name"`
 	Content any    `json:"content"`
+	IsError bool   `json:"is_error,omitempty"`
 }
 
-// ModelTurn representa la respuesta del modelo de IA: o pide ejecutar tools o entrega texto final[cite: 6].
 type ModelTurn struct {
 	Text      string     `json:"text,omitempty"`
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
