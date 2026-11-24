@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // LLMProvider abstrae cualquier modelo de IA en la nube (Gemini, OpenAI, etc.).
 type LLMProvider interface {
@@ -9,23 +12,26 @@ type LLMProvider interface {
 
 // Interfaces segregadas por dominio (ISP) para que cada tool dependa solo de lo que usa.
 type TutorClient interface {
+	ListarRamos(ctx context.Context) ([]Ramo, error)
 	BuscarTutores(ctx context.Context, ramoCodigo string) ([]TutorResumen, error)
 }
 
 type SesionesClient interface {
-	VerDisponibilidad(ctx context.Context, tutorID, dia string) ([]BloqueDisponibilidad, error)
-	CrearReserva(ctx context.Context, tutorID, estudianteID, ramoCodigo, horario string) (ReservaCreada, error)
+	BuscarDisponibilidad(ctx context.Context, ramoCodigo string, desde, hasta time.Time) ([]BloqueDisponibilidad, error)
+	VerDisponibilidad(ctx context.Context, tutorID string, desde, hasta time.Time) ([]BloqueDisponibilidad, error)
+	CrearReserva(ctx context.Context, tutorID, estudianteID, ramoCodigo string, inicio time.Time) (ReservaCreada, error)
 }
 
-type MaterialClient interface {
-	GenerarQuiz(ctx context.Context, sesionID, ramoCodigo string) (QuizResultado, error)
-}
-
-// BFFClient compone las capacidades segregadas para el adaptador HTTP/GraphQL hacia el BFF.
+// BFFClient compone las capacidades segregadas para el adaptador GraphQL hacia el BFF.
 type BFFClient interface {
 	TutorClient
 	SesionesClient
-	MaterialClient
+}
+
+// ConversationStore persiste el historial por usuario y conversacionId.
+type ConversationStore interface {
+	Obtener(usuarioID, conversacionID string) []MensajeChat
+	Guardar(usuarioID, conversacionID string, mensajes []MensajeChat)
 }
 
 // Tool aplica el Patrón Strategy/Command para cada herramienta MCP.

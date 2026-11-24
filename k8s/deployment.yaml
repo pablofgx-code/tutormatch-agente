@@ -1,48 +1,48 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: tutormatch-agente
+  name: agente
   labels:
-    app: tutormatch-agente
+    app: agente
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: tutormatch-agente
+      app: agente
   template:
     metadata:
       labels:
-        app: tutormatch-agente
+        app: agente
     spec:
       containers:
         - name: agente
           image: tutormatch-agente:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8080
+            - containerPort: 8081
               name: http
           env:
             - name: PORT
-              value: "8080"
+              value: "8081"
             - name: GEMINI_MODEL
               value: "gemini-flash-lite-latest"
             - name: BFF_URL
-              value: "http://tutormatch-bff:3000/graphql"
+              value: "http://bff:3000/graphql"
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: tutormatch-agente-secrets
+                  name: agente-secrets
                   key: gemini-api-key
           readinessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: 8081
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: 8081
             initialDelaySeconds: 10
             periodSeconds: 20
           resources:
@@ -54,19 +54,20 @@ spec:
               memory: "256Mi"
           securityContext:
             runAsNonRoot: true
+            runAsUser: 10001
             allowPrivilegeEscalation: false
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: tutormatch-agente
+  name: agente
   labels:
-    app: tutormatch-agente
+    app: agente
 spec:
   type: ClusterIP
   selector:
-    app: tutormatch-agente
+    app: agente
   ports:
     - name: http
-      port: 8080
-      targetPort: 8080
+      port: 8081
+      targetPort: 8081

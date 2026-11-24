@@ -1,27 +1,65 @@
 package domain
 
 import (
+	"context"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// ChatRequest representa el mensaje que envía el BFF al endpoint POST /agent/chat.
+const (
+	maxMensajeRunes      = 2000
+	maxConversacionIDLen = 128
+)
+
+type authTokenKey struct{}
+
+// ConAuthToken guarda la cabecera Authorization (Bearer <token>) en el contexto para reenviarla al BFF.
+func ConAuthToken(ctx context.Context, authHeader string) context.Context {
+	return context.WithValue(ctx, authTokenKey{}, strings.TrimSpace(authHeader))
+}
+
+// AuthTokenDesdeContexto recupera la cabecera Authorization del contexto si existe.
+func AuthTokenDesdeContexto(ctx context.Context) string {
+	val, _ := ctx.Value(authTokenKey{}).(string)
+	return val
+}
+
+// ChatRequest representa el cuerpo que envía el BFF a POST /agent/chat (contrato rest/agente.md).
 type ChatRequest struct {
-	UsuarioID string        `json:"usuario_id"`
-	Mensaje   string        `json:"mensaje"`
-	Historial []MensajeChat `json:"historial,omitempty"`
+	UsuarioID      string `json:"usuarioId"`
+	ConversacionID string `json:"conversacionId,omitempty"`
+	Mensaje        string `json:"mensaje"`
 }
 
 func (r ChatRequest) Validar() error {
-	if strings.TrimSpace(r.UsuarioID) == "" || strings.TrimSpace(r.Mensaje) == "" {
+	usuarioID := strings.TrimSpace(r.UsuarioID)
+	mensaje := strings.TrimSpace(r.Mensaje)
+	convID := strings.TrimSpace(r.ConversacionID)
+
+	if usuarioID == "" || mensaje == "" {
+		return ErrArgumentoInvalido
+	}
+	if utf8.RuneCountInString(mensaje) > maxMensajeRunes {
+		return ErrArgumentoInvalido
+	}
+	if len(convID) > maxConversacionIDLen {
 		return ErrArgumentoInvalido
 	}
 	return nil
 }
 
-// ChatResponse es la respuesta final redactada por el agente hacia el BFF.
+// AccionAgente informa al BFF y al frontend qué mutaciones ejecutó el agente para refrescar vistas.
+type AccionAgente struct {
+	Tipo string `json:"tipo"`
+	ID   string `json:"id"`
+}
+
+// ChatResponse es la respuesta final devuelta al BFF.
 type ChatResponse struct {
-	Respuesta string `json:"respuesta"`
+	ConversacionID string         `json:"conversacionId"`
+	Respuesta      string         `json:"respuesta"`
+	Acciones       []AccionAgente `json:"acciones"`
 }
 
 type RolMensaje string
@@ -47,39 +85,43 @@ type ToolDefinition struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
+type Ramo struct {
+	Codigo string `json:"codigo"`
+	Nombre string `json:"nombre"`
+}
+
+type RamoTutor struct {
+	Ramo   Ramo `json:"ramo"`
+	Activo bool `json:"activo"`
+}
+
 type TutorResumen struct {
-	ID     string   `json:"id"`
-	Nombre string   `json:"nombre"`
-	Email  string   `json:"email"`
-	Ramos  []string `json:"ramos"`
+	ID                   string      `json:"id"`
+	Nombre               string      `json:"nombre"`
+	Email                string      `json:"email"`
+	PromedioEvaluaciones float64     `json:"promedioEvaluaciones"`
+	CantidadEvaluaciones int         `json:"cantidadEvaluaciones"`
+	Ramos                []RamoTutor `json:"ramos"`
 }
 
 type BloqueDisponibilidad struct {
-	ID      string `json:"id"`
-	TutorID string `json:"tutor_id"`
-	Dia     string `json:"dia"`
-	HoraIni string `json:"hora_ini"`
-	HoraFin string `json:"hora_fin"`
+	ID         string    `json:"id"`
+	TutorID    string    `json:"tutorId"`
+	RamoCodigo string    `json:"ramoCodigo"`
+	Inicio     time.Time `json:"inicio"`
+	Fin        time.Time `json:"fin"`
+	Libre      bool      `json:"libre"`
 }
 
 type ReservaCreada struct {
-	SesionID     string    `json:"sesion_id"`
-	TutorID      string    `json:"tutor_id"`
-	EstudianteID string    `json:"estudiante_id"`
-	RamoCodigo   string    `json:"ramo_codigo"`
+	ID           string    `json:"id"`
+	TutorID      string    `json:"tutorId"`
+	EstudianteID string    `json:"estudianteId"`
+	RamoCodigo   string    `json:"ramoCodigo"`
+	Inicio       time.Time `json:"inicio"`
+	Fin          time.Time `json:"fin"`
 	Estado       string    `json:"estado"`
-	CreadaEn     time.Time `json:"creada_en"`
-}
-
-type PreguntaQuiz struct {
-	Pregunta          string   `json:"pregunta"`
-	Opciones          []string `json:"opciones"`
-	RespuestaCorrecta string   `json:"respuesta_correcta"`
-}
-
-type QuizResultado struct {
-	RamoCodigo string         `json:"ramo_codigo"`
-	Preguntas  []PreguntaQuiz `json:"preguntas"`
+	CreadaEn     time.Time `json:"creadaEn"`
 }
 
 type ToolCall struct {

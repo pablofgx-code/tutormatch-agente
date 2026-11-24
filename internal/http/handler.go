@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"net"
 	"net/http"
 	"strings"
 
@@ -20,22 +22,33 @@ type ChatProcessor interface {
 type Handler struct {
 	chat     ChatProcessor
 	registry domain.ToolRegistry
+	limiter  RateLimiter
 }
 
-func NewHandler(chat ChatProcessor, registry domain.ToolRegistry) *Handler {
+func NewHandler(chat ChatProcessor, registry domain.ToolRegistry, limiter RateLimiter) *Handler {
 	return &Handler{
 		chat:     chat,
 		registry: registry,
+		limiter:  limiter,
 	}
 }
 
-// Routes registra las rutas REST, MCP y healthcheck usando el enrutador estándar de Go.
+// Routes registra las rutas REST, MCP y healthcheck envueltas con cabeceras de seguridad.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", h.handleHealth)
 	mux.HandleFunc("POST /agent/chat", h.handleAgentChat)
 	mux.HandleFunc("POST /mcp", h.handleMCP)
-	return mux
+	return conCabecerasSeguridad(mux)
+}
+
+func conCabecerasSeguridad(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -52,7 +65,15 @@ func (h *Handler) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.chat.ProcesarChat(r.Context(), req)
+	if !h.permitirPeticion(claveLimite("chat", req.UsuarioID, r)) {
+		w.Header().Set("Retry-After", "6")
+		escribirError(w, http.StatusTooManyRequests, "demasiadas solicitudes; intenta nuevamente en unos segundos")
+		return
+	}
+
+	ctx := domain.ConAuthToken(r.Context(), r.Header.Get("Authorization"))
+
+	resp, err := h.chat.ProcesarChat(ctx, req)
 	if err != nil {
 		h.responderErrorDominio(w, err)
 		return
@@ -91,6 +112,15 @@ func (h *Handler) handleMCP(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	defer r.Body.Close()
 
+	if !h.permitirPeticion(claveLimite("mcp", r.Header.Get("X-Usuario-Id"), r)) {
+		w.Header().Set("Retry-After", "6")
+		escribirJSON(w, http.StatusTooManyRequests, mcpResponse{
+			JSONRPC: "2.0",
+			Error:   &mcpRPCError{Code: -32000, Message: "demasiadas solicitudes MCP"},
+		})
+		return
+	}
+
 	var req mcpRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		escribirJSON(w, http.StatusBadRequest, mcpResponse{
@@ -107,12 +137,22 @@ func (h *Handler) handleMCP(w http.ResponseWriter, r *http.Request) {
 			ID:      req.ID,
 			Result: map[string]any{
 				"protocolVersion": "2024-11-05",
-				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 				"serverInfo": map[string]string{
 					"name":    "tutormatch-mcp-server",
 					"version": "1.0.0",
 				},
 			},
+		})
+
+	case "notifications/initialized":
+		w.WriteHeader(http.StatusAccepted)
+
+	case "ping":
+		escribirJSON(w, http.StatusOK, mcpResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result:  map[string]any{},
 		})
 
 	case "tools/list":
@@ -164,8 +204,10 @@ func (h *Handler) handleMCPToolCall(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
+	ctx := domain.ConAuthToken(r.Context(), r.Header.Get("Authorization"))
 	usuarioID := strings.TrimSpace(r.Header.Get("X-Usuario-Id"))
-	salida, err := tool.Execute(r.Context(), usuarioID, params.Arguments)
+
+	salida, err := tool.Execute(ctx, usuarioID, params.Arguments)
 	if err != nil {
 		escribirJSON(w, http.StatusOK, mcpResponse{
 			JSONRPC: "2.0",
@@ -189,15 +231,37 @@ func (h *Handler) handleMCPToolCall(w http.ResponseWriter, r *http.Request, req 
 	})
 }
 
+func (h *Handler) permitirPeticion(clave string) bool {
+	if h.limiter == nil {
+		return true
+	}
+	return h.limiter.Allow(clave)
+}
+
+func claveLimite(prefijo, usuarioID string, r *http.Request) string {
+	if id := strings.TrimSpace(usuarioID); id != "" {
+		return prefijo + ":user:" + id
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil || host == "" {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	return prefijo + ":ip:" + host
+}
+
+// responderErrorDominio registra el detalle técnico en logs y devuelve mensajes saneados al cliente.
 func (h *Handler) responderErrorDominio(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrArgumentoInvalido):
-		escribirError(w, http.StatusBadRequest, err.Error())
+		escribirError(w, http.StatusBadRequest, domain.ErrArgumentoInvalido.Error())
 	case errors.Is(err, domain.ErrProveedorIA):
-		escribirError(w, http.StatusBadGateway, err.Error())
+		log.Printf("[HTTP] Error proveedor IA: %v", err)
+		escribirError(w, http.StatusServiceUnavailable, "el servicio de IA no está disponible temporalmente")
 	case errors.Is(err, domain.ErrMaxIteraciones):
-		escribirError(w, http.StatusGatewayTimeout, err.Error())
+		log.Printf("[HTTP] Máximo de iteraciones alcanzado: %v", err)
+		escribirError(w, http.StatusGatewayTimeout, domain.ErrMaxIteraciones.Error())
 	default:
+		log.Printf("[HTTP] Error interno inesperado: %v", err)
 		escribirError(w, http.StatusInternalServerError, "error interno del servidor")
 	}
 }

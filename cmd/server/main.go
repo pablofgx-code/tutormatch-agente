@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,7 +20,10 @@ import (
 )
 
 func main() {
-	port := getEnv("PORT", "8080")
+	// Carga .env en desarrollo local sin sobrescribir variables ya definidas por OS/Docker/K8s.
+	cargarDotEnv(".env")
+
+	port := getEnv("PORT", "8081")
 	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
 	geminiModel := getEnv("GEMINI_MODEL", "gemini-flash-lite-latest")
 	bffURL := os.Getenv("BFF_URL")
@@ -37,18 +42,23 @@ func main() {
 		bffClient = adapter.NewMockBFFClient()
 	}
 
+	// Patrón Decorator: cachea el catálogo de ramos por 10 minutos
+	bffConCache := adapter.NewCachedBFFClient(bffClient, 10*time.Minute)
+
 	// Inyección de dependencias (Clean Architecture)
-	registry := mcp.NewDefaultRegistry(bffClient)
+	registry := mcp.NewDefaultRegistry(bffConCache)
 	llmProvider := adapter.NewGeminiProvider(geminiAPIKey, geminiModel, nil)
-	agentService := service.NewAgentService(llmProvider, registry, 6)
-	handler := httpadapter.NewHandler(agentService, registry)
+	convStore := adapter.NewLRUConversationStore(1000, 30*time.Minute, 30)
+	agentService := service.NewAgentService(llmProvider, registry, convStore, 6)
+	rateLimiter := httpadapter.NewTokenBucketLimiter(10, time.Minute, 5, 5000)
+	handler := httpadapter.NewHandler(agentService, registry, rateLimiter)
 
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      180 * time.Second, // Da margen para múltiples turnos del agente
+		WriteTimeout:      180 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -77,4 +87,36 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+// cargarDotEnv lee pares CLAVE=VALOR de un archivo local sin dependencias externas.
+func cargarDotEnv(ruta string) {
+	f, err := os.Open(ruta)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		linea := strings.TrimSpace(strings.TrimPrefix(scanner.Text(), "\ufeff"))
+		if linea == "" || strings.HasPrefix(linea, "#") {
+			continue
+		}
+		clave, valor, ok := strings.Cut(linea, "=")
+		if !ok {
+			continue
+		}
+		clave = strings.TrimSpace(clave)
+		valor = strings.Trim(strings.TrimSpace(valor), `"'`)
+		if clave == "" {
+			continue
+		}
+		if _, existe := os.LookupEnv(clave); !existe {
+			_ = os.Setenv(clave, valor)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("advertencia leyendo %s: %v", ruta, err)
+	}
 }

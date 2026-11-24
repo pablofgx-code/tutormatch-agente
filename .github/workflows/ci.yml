@@ -33,3 +33,6 @@ jobs:
           TOTAL=$(go tool cover -func=coverage.out | grep total: | awk '{print substr($3, 1, length($3)-1)}')
           echo "Cobertura total: ${TOTAL}%"
           awk -v cov="$TOTAL" 'BEGIN { if (cov < 60.0) { print "ERROR: cobertura menor al 60%"; exit 1 } }'
+
+      - name: Validar construcción de imagen Docker
+        run: docker build -t tutormatch-agente:${{ github.sha }} .

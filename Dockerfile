@@ -18,7 +18,7 @@ RUN apk --no-cache add ca-certificates tzdata \
 WORKDIR /app
 COPY --from=builder /app/agente /app/agente
 
-USER appuser
-EXPOSE 8080
+USER 10001:10001
+EXPOSE 8081
 
 ENTRYPOINT ["/app/agente"]

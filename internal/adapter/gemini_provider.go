@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -18,21 +19,53 @@ const (
 	defaultGeminiModel   = "gemini-flash-lite-latest"
 	defaultGeminiTimeout = 90 * time.Second
 	defaultThinkingLevel = "LOW"
+	defaultMaxRetries    = 2
+	defaultRetryDelay    = 600 * time.Millisecond
 )
 
-const systemPromptTutorMatch = `Eres el asistente de tutorías universitarias de TutorMatch.
+var diasEspanol = map[time.Weekday]string{
+	time.Sunday:    "domingo",
+	time.Monday:    "lunes",
+	time.Tuesday:   "martes",
+	time.Wednesday: "miércoles",
+	time.Thursday:  "jueves",
+	time.Friday:    "viernes",
+	time.Saturday:  "sábado",
+}
+
+func construirSystemPrompt(ahora time.Time) string {
+	loc := zonaChile()
+	local := ahora.In(loc)
+	offset := local.Format("-07:00")
+
+	return fmt.Sprintf(`Eres el asistente de tutorías universitarias de TutorMatch.
 Responde siempre en español de forma clara, breve y amable.
-Catálogo de códigos de ramos conocidos:
-- MAT1610: Cálculo I
-- MAT1620: Cálculo II
-- IIC1103: Introducción a la Programación
-- IIC2133: Estructuras de Datos y Algoritmos
-- FIS1514: Dinámica
+
+Contexto temporal actual (zona horaria Chile - America/Santiago):
+- Hoy es %s %s (hora local %s, desfase UTC %s).
+- Todas las fechas enviadas a las herramientas deben ir en formato ISO-8601 UTC (sufijo Z). Para convertir hora de Chile a UTC, aplica el desfase %s.
+
+Bloques oficiales de tutoría (lunes a viernes, 90 minutos cada uno, hora de Chile):
+- Bloque A (mañana): 08:10 - 09:40
+- Bloque B (mañana): 09:55 - 11:25
+- Bloque C (mañana): 11:40 - 13:10
+- Bloque D (tarde): 14:30 - 16:00
+- Bloque E (tarde): 16:15 - 17:45
+- Bloque F (tarde): 18:00 - 19:30
 
 Reglas estrictas:
-1. Usa siempre las herramientas disponibles para consultar tutores, horarios o generar quizzes; nunca inventes tutores ni horarios.
-2. Cuando un estudiante pida ayuda con un ramo y un día/horario, primero busca tutores con buscar_tutores y luego consulta la disponibilidad de TODOS los tutores encontrados usando ver_disponibilidad.
-3. Propón todas las opciones disponibles al estudiante y ejecuta crear_reserva ÚNICAMENTE cuando el estudiante haya confirmado el tutor y el horario.`
+1. Usa siempre las herramientas disponibles; nunca inventes tutores, ramos ni horarios.
+2. Si necesitas conocer el código oficial de un ramo, llama primero a listar_ramos.
+3. Cuando un estudiante pida ayuda con un ramo en un día/franja (ej. "el jueves en la tarde"), calcula el rango UTC correspondiente (ej. bloques D, E y F de ese jueves) y llama en paralelo a buscar_disponibilidad y buscar_tutores.
+4. Al mostrar horarios al estudiante, usa SIEMPRE el texto exacto del campo "horarioChile" devuelto por la herramienta (no recalcules zonas horarias manualmente).
+5. Ejecuta crear_reserva ÚNICAMENTE cuando el estudiante haya confirmado el tutor y el horario exacto, enviando el timestamp exacto del campo "inicio" UTC devuelto por la disponibilidad.`,
+		diasEspanol[local.Weekday()],
+		local.Format("2006-01-02"),
+		local.Format("15:04"),
+		offset,
+		offset,
+	)
+}
 
 // GeminiProvider implementa domain.LLMProvider conectándose a Google Gemini en la nube.
 type GeminiProvider struct {
@@ -40,6 +73,8 @@ type GeminiProvider struct {
 	model      string
 	baseURL    string
 	httpClient *http.Client
+	maxRetries int
+	retryDelay time.Duration
 }
 
 func NewGeminiProvider(apiKey, model string, httpClient *http.Client) *GeminiProvider {
@@ -47,13 +82,15 @@ func NewGeminiProvider(apiKey, model string, httpClient *http.Client) *GeminiPro
 		model = defaultGeminiModel
 	}
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: defaultGeminiTimeout}
+		httpClient = NewPooledHTTPClient(defaultGeminiTimeout)
 	}
 	return &GeminiProvider{
 		apiKey:     strings.TrimSpace(apiKey),
 		model:      strings.TrimSpace(model),
 		baseURL:    defaultGeminiBaseURL,
 		httpClient: httpClient,
+		maxRetries: defaultMaxRetries,
+		retryDelay: defaultRetryDelay,
 	}
 }
 
@@ -130,7 +167,7 @@ func (p *GeminiProvider) GenerarTurno(ctx context.Context, mensajes []domain.Men
 
 	reqBody := geminiRequest{
 		SystemInstruction: &geminiContent{
-			Parts: []geminiPart{{Text: systemPromptTutorMatch}},
+			Parts: []geminiPart{{Text: construirSystemPrompt(time.Now())}},
 		},
 		Contents: mapearHistorial(mensajes),
 		Tools:    mapearTools(tools),
@@ -147,41 +184,87 @@ func (p *GeminiProvider) GenerarTurno(ctx context.Context, mensajes []domain.Men
 	}
 
 	url := fmt.Sprintf("%s/%s:generateContent", p.baseURL, p.model)
+
+	var ultimoErr error
+	for intento := 0; intento <= p.maxRetries; intento++ {
+		turno, reintentable, err := p.ejecutarLlamada(ctx, url, payload)
+		if err == nil {
+			return turno, nil
+		}
+		ultimoErr = err
+		if !reintentable || intento == p.maxRetries {
+			break
+		}
+
+		espera := p.retryDelay * time.Duration(intento+1)
+		log.Printf("[Gemini] Error transitorio (%v); reintentando en %v (intento %d/%d)...", err, espera, intento+1, p.maxRetries)
+		if err := esperarConContexto(ctx, espera); err != nil {
+			return domain.ModelTurn{}, err
+		}
+	}
+
+	return domain.ModelTurn{}, ultimoErr
+}
+
+func (p *GeminiProvider) ejecutarLlamada(ctx context.Context, url string, payload []byte) (domain.ModelTurn, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return domain.ModelTurn{}, fmt.Errorf("error creando petición HTTP a Gemini: %w", err)
+		return domain.ModelTurn{}, false, fmt.Errorf("error creando petición HTTP a Gemini: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", p.apiKey)
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return domain.ModelTurn{}, fmt.Errorf("error llamando a Gemini: %w", err)
+		return domain.ModelTurn{}, ctx.Err() == nil, fmt.Errorf("error llamando a Gemini: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if err != nil {
-		return domain.ModelTurn{}, fmt.Errorf("error leyendo respuesta de Gemini: %w", err)
+		return domain.ModelTurn{}, false, fmt.Errorf("error leyendo respuesta de Gemini: %w", err)
 	}
 
 	var gResp geminiResponse
 	if err := json.Unmarshal(body, &gResp); err != nil {
-		return domain.ModelTurn{}, fmt.Errorf("respuesta JSON inválida de Gemini (HTTP %d): %w", resp.StatusCode, err)
+		return domain.ModelTurn{}, esStatusReintentable(resp.StatusCode), fmt.Errorf("respuesta JSON inválida de Gemini (HTTP %d): %w", resp.StatusCode, err)
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		reintentable := esStatusReintentable(resp.StatusCode)
 		if gResp.Error != nil {
-			return domain.ModelTurn{}, fmt.Errorf("error API Gemini (%d): %s", gResp.Error.Code, gResp.Error.Message)
+			return domain.ModelTurn{}, reintentable, fmt.Errorf("error API Gemini (%d): %s", gResp.Error.Code, gResp.Error.Message)
 		}
-		return domain.ModelTurn{}, fmt.Errorf("error API Gemini HTTP %d", resp.StatusCode)
+		return domain.ModelTurn{}, reintentable, fmt.Errorf("error API Gemini HTTP %d", resp.StatusCode)
 	}
 
 	if len(gResp.Candidates) == 0 {
-		return domain.ModelTurn{}, fmt.Errorf("Gemini no devolvió candidatos en la respuesta")
+		return domain.ModelTurn{}, false, fmt.Errorf("Gemini no devolvió candidatos en la respuesta")
 	}
 
-	return parsearRespuestaGemini(gResp.Candidates[0].Content), nil
+	return parsearRespuestaGemini(gResp.Candidates[0].Content), false, nil
+}
+
+func esStatusReintentable(code int) bool {
+	return code == http.StatusTooManyRequests ||
+		code == http.StatusInternalServerError ||
+		code == http.StatusBadGateway ||
+		code == http.StatusServiceUnavailable ||
+		code == http.StatusGatewayTimeout
+}
+
+func esperarConContexto(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // mapearHistorial convierte los mensajes agnósticos del dominio al formato de Gemini,
@@ -223,7 +306,6 @@ func mapearHistorial(mensajes []domain.MensajeChat) []geminiContent {
 			part := geminiPart{
 				FunctionResponse: &geminiFunctionResponse{
 					Name: msg.ToolResult.Name,
-					// Gemini exige que "response" sea siempre un objeto JSON.
 					Response: map[string]any{
 						"resultado": msg.ToolResult.Content,
 						"es_error":  msg.ToolResult.IsError,
@@ -231,7 +313,6 @@ func mapearHistorial(mensajes []domain.MensajeChat) []geminiContent {
 				},
 			}
 
-			// Si el último turno ya contiene functionResponses paralelas, las agrupamos juntas.
 			if n := len(contents); n > 0 && contents[n-1].Role == "user" && len(contents[n-1].Parts) > 0 && contents[n-1].Parts[0].FunctionResponse != nil {
 				contents[n-1].Parts = append(contents[n-1].Parts, part)
 			} else {

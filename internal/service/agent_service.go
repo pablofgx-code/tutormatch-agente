@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,40 +14,51 @@ import (
 
 const defaultMaxIteraciones = 6
 
-// AgentService orquesta el ciclo de conversación entre el modelo de IA y las tools MCP.
+// AgentService orquesta exclusivamente el loop de conversación entre el LLM y las tools MCP (SRP).
 type AgentService struct {
 	llm            domain.LLMProvider
 	registry       domain.ToolRegistry
+	store          domain.ConversationStore
 	maxIteraciones int
 }
 
-func NewAgentService(llm domain.LLMProvider, registry domain.ToolRegistry, maxIteraciones int) *AgentService {
+func NewAgentService(llm domain.LLMProvider, registry domain.ToolRegistry, store domain.ConversationStore, maxIteraciones int) *AgentService {
 	if maxIteraciones <= 0 {
 		maxIteraciones = defaultMaxIteraciones
 	}
 	return &AgentService{
 		llm:            llm,
 		registry:       registry,
+		store:          store,
 		maxIteraciones: maxIteraciones,
 	}
 }
 
-// ProcesarChat ejecuta el loop del agente hasta obtener una respuesta en texto o agotar iteraciones.
+// ProcesarChat ejecuta el loop del agente, persiste el historial en el store y reporta acciones.
 func (s *AgentService) ProcesarChat(ctx context.Context, req domain.ChatRequest) (domain.ChatResponse, error) {
 	if err := req.Validar(); err != nil {
 		return domain.ChatResponse{}, err
 	}
 
-	// Copiamos el historial para no mutar el slice original y agregamos el mensaje actual.
-	mensajes := make([]domain.MensajeChat, len(req.Historial), len(req.Historial)+1)
-	copy(mensajes, req.Historial)
+	convID := strings.TrimSpace(req.ConversacionID)
+	if convID == "" {
+		convID = generarIDConversacion()
+	}
+
+	var historialPrevio []domain.MensajeChat
+	if s.store != nil {
+		historialPrevio = s.store.Obtener(req.UsuarioID, convID)
+	}
+
+	mensajes := make([]domain.MensajeChat, len(historialPrevio), len(historialPrevio)+1)
+	copy(mensajes, historialPrevio)
 	mensajes = append(mensajes, domain.MensajeChat{
 		Rol:   domain.RolUsuario,
 		Texto: req.Mensaje,
 	})
 
-	// Obtenemos las definiciones una sola vez fuera del loop (evita reconstrucciones repetidas).
 	toolDefs := s.registry.Definitions()
+	acciones := make([]domain.AccionAgente, 0)
 
 	for paso := 0; paso < s.maxIteraciones; paso++ {
 		if err := ctx.Err(); err != nil {
@@ -53,14 +66,14 @@ func (s *AgentService) ProcesarChat(ctx context.Context, req domain.ChatRequest)
 		}
 
 		inicio := time.Now()
-		log.Printf("[Agente] Paso %d: consultando modelo de IA...", paso+1)
+		log.Printf("[Agente] Conv=%s Paso %d: consultando modelo de IA...", convID, paso+1)
 
 		turno, err := s.llm.GenerarTurno(ctx, mensajes, toolDefs)
 		if err != nil {
 			return domain.ChatResponse{}, fmt.Errorf("%w: %w", domain.ErrProveedorIA, err)
 		}
 
-		log.Printf("[Agente] Paso %d respondido en %v (tools solicitadas: %d)", paso+1, time.Since(inicio).Round(time.Millisecond), len(turno.ToolCalls))
+		log.Printf("[Agente] Conv=%s Paso %d respondido en %v (tools solicitadas: %d)", convID, paso+1, time.Since(inicio).Round(time.Millisecond), len(turno.ToolCalls))
 
 		mensajes = append(mensajes, domain.MensajeChat{
 			Rol:       domain.RolModelo,
@@ -68,14 +81,28 @@ func (s *AgentService) ProcesarChat(ctx context.Context, req domain.ChatRequest)
 			ToolCalls: turno.ToolCalls,
 		})
 
-		// Condición de salida: el modelo ya tiene la respuesta final y no solicita más tools.
 		if len(turno.ToolCalls) == 0 {
-			return domain.ChatResponse{Respuesta: turno.Text}, nil
+			if s.store != nil {
+				s.store.Guardar(req.UsuarioID, convID, mensajes)
+			}
+			return domain.ChatResponse{
+				ConversacionID: convID,
+				Respuesta:      turno.Text,
+				Acciones:       acciones,
+			}, nil
 		}
 
 		resultados := s.ejecutarTools(ctx, req.UsuarioID, turno.ToolCalls)
 		for i := range resultados {
 			res := resultados[i]
+			if !res.IsError && res.Name == "crear_reserva" {
+				if reserva, ok := res.Content.(domain.ReservaCreada); ok && reserva.ID != "" {
+					acciones = append(acciones, domain.AccionAgente{
+						Tipo: "sesion.creada",
+						ID:   reserva.ID,
+					})
+				}
+			}
 			mensajes = append(mensajes, domain.MensajeChat{
 				Rol:        domain.RolHerramienta,
 				ToolResult: &res,
@@ -107,7 +134,7 @@ func (s *AgentService) ejecutarTools(ctx context.Context, usuarioID string, call
 	return resultados
 }
 
-// ejecutarUnaTool resuelve la herramienta en O(1) y encapsula errores para que el modelo pueda recuperarse.
+// ejecutarUnaTool resuelve la herramienta en O(1) y encapsula errores para autocorrección del modelo.
 func (s *AgentService) ejecutarUnaTool(ctx context.Context, usuarioID string, call domain.ToolCall) domain.ToolResult {
 	log.Printf("[Agente] Ejecutando tool '%s' con args=%v", call.Name, call.Arguments)
 
@@ -136,4 +163,12 @@ func (s *AgentService) ejecutarUnaTool(ctx context.Context, usuarioID string, ca
 		Name:    call.Name,
 		Content: salida,
 	}
+}
+
+func generarIDConversacion() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("conv-%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

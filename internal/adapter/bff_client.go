@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tutormatch/agente/internal/domain"
@@ -17,10 +16,31 @@ import (
 const (
 	defaultHTTPTimeout   = 10 * time.Second
 	maxResponseBodyBytes = 2 << 20 // 2 MB de protección contra respuestas gigantes
+	duracionBloque       = 90 * time.Minute
 )
 
-// --- 1. Adaptador real HTTP/GraphQL hacia el BFF ---
+// NewPooledHTTPClient configura un pool reutilizable de conexiones HTTP/2 y TLS por host.
+func NewPooledHTTPClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 20
+	transport.IdleConnTimeout = 90 * time.Second
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+}
 
+// zonaChile carga America/Santiago con fallback seguro para entornos Windows sin base tzdata.
+func zonaChile() *time.Location {
+	loc, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		return time.FixedZone("America/Santiago", -3*3600)
+	}
+	return loc
+}
+
+// HTTPBFFClient implementa domain.BFFClient sobre el endpoint GraphQL del BFF real.
 type HTTPBFFClient struct {
 	endpoint   string
 	httpClient *http.Client
@@ -28,7 +48,7 @@ type HTTPBFFClient struct {
 
 func NewHTTPBFFClient(endpoint string, httpClient *http.Client) *HTTPBFFClient {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: defaultHTTPTimeout}
+		httpClient = NewPooledHTTPClient(defaultHTTPTimeout)
 	}
 	return &HTTPBFFClient{
 		endpoint:   strings.TrimRight(endpoint, "/"),
@@ -50,7 +70,7 @@ type graphQLResponse struct {
 	Errors []graphQLError  `json:"errors,omitempty"`
 }
 
-// ejecutarGraphQL centraliza (DRY) todas las consultas y mutaciones hacia el BFF.
+// ejecutarGraphQL centraliza (DRY) las consultas y mutaciones hacia el BFF, reenviando el JWT.
 func (c *HTTPBFFClient) ejecutarGraphQL(ctx context.Context, query string, variables map[string]any, destino any) error {
 	payload, err := json.Marshal(graphQLRequest{
 		Query:     query,
@@ -65,6 +85,9 @@ func (c *HTTPBFFClient) ejecutarGraphQL(ctx context.Context, query string, varia
 		return fmt.Errorf("%w: error creando petición HTTP: %v", domain.ErrServicioExterno, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if authHeader := domain.AuthTokenDesdeContexto(ctx); authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -95,6 +118,21 @@ func (c *HTTPBFFClient) ejecutarGraphQL(ctx context.Context, query string, varia
 	return nil
 }
 
+func (c *HTTPBFFClient) ListarRamos(ctx context.Context) ([]domain.Ramo, error) {
+	const query = `
+		query ListarRamos {
+			ramos {
+				codigo
+				nombre
+			}
+		}`
+	var out struct {
+		Ramos []domain.Ramo `json:"ramos"`
+	}
+	err := c.ejecutarGraphQL(ctx, query, nil, &out)
+	return out.Ramos, err
+}
+
 func (c *HTTPBFFClient) BuscarTutores(ctx context.Context, ramoCodigo string) ([]domain.TutorResumen, error) {
 	const query = `
 		query BuscarTutores($ramoCodigo: String!) {
@@ -102,7 +140,15 @@ func (c *HTTPBFFClient) BuscarTutores(ctx context.Context, ramoCodigo string) ([
 				id
 				nombre
 				email
-				ramos
+				promedioEvaluaciones
+				cantidadEvaluaciones
+				ramos {
+					activo
+					ramo {
+						codigo
+						nombre
+					}
+				}
 			}
 		}`
 	var out struct {
@@ -112,177 +158,83 @@ func (c *HTTPBFFClient) BuscarTutores(ctx context.Context, ramoCodigo string) ([
 	return out.TutoresPorRamo, err
 }
 
-func (c *HTTPBFFClient) VerDisponibilidad(ctx context.Context, tutorID, dia string) ([]domain.BloqueDisponibilidad, error) {
+func (c *HTTPBFFClient) BuscarDisponibilidad(ctx context.Context, ramoCodigo string, desde, hasta time.Time) ([]domain.BloqueDisponibilidad, error) {
 	const query = `
-		query VerDisponibilidad($tutorId: String!, $dia: String) {
-			disponibilidadTutor(tutorId: $tutorId, dia: $dia) {
+		query BuscarDisponibilidad($ramoCodigo: String!, $desde: DateTime!, $hasta: DateTime!) {
+			buscarDisponibilidad(ramoCodigo: $ramoCodigo, desde: $desde, hasta: $hasta) {
 				id
-				tutor_id
-				dia
-				hora_ini
-				hora_fin
+				tutorId
+				ramoCodigo
+				inicio
+				fin
+				libre
 			}
 		}`
 	var out struct {
-		DisponibilidadTutor []domain.BloqueDisponibilidad `json:"disponibilidadTutor"`
-	}
-	err := c.ejecutarGraphQL(ctx, query, map[string]any{"tutorId": tutorID, "dia": dia}, &out)
-	return out.DisponibilidadTutor, err
-}
-
-func (c *HTTPBFFClient) CrearReserva(ctx context.Context, tutorID, estudianteID, ramoCodigo, horario string) (domain.ReservaCreada, error) {
-	const mutation = `
-		mutation CrearReserva($tutorId: String!, $estudianteId: String!, $ramoCodigo: String!, $horario: String!) {
-			crearReserva(tutorId: $tutorId, estudianteId: $estudianteId, ramoCodigo: $ramoCodigo, horario: $horario) {
-				sesion_id
-				tutor_id
-				estudiante_id
-				ramo_codigo
-				estado
-				creada_en
-			}
-		}`
-	var out struct {
-		CrearReserva domain.ReservaCreada `json:"crearReserva"`
+		BuscarDisponibilidad []domain.BloqueDisponibilidad `json:"buscarDisponibilidad"`
 	}
 	vars := map[string]any{
-		"tutorId":      tutorID,
-		"estudianteId": estudianteID,
-		"ramoCodigo":   ramoCodigo,
-		"horario":      horario,
-	}
-	err := c.ejecutarGraphQL(ctx, mutation, vars, &out)
-	return out.CrearReserva, err
-}
-
-func (c *HTTPBFFClient) GenerarQuiz(ctx context.Context, sesionID, ramoCodigo string) (domain.QuizResultado, error) {
-	const query = `
-		query GenerarQuiz($sesionId: String, $ramoCodigo: String!) {
-			generarQuiz(sesionId: $sesionId, ramoCodigo: $ramoCodigo) {
-				ramo_codigo
-				preguntas {
-					pregunta
-					opciones
-					respuesta_correcta
-				}
-			}
-		}`
-	var out struct {
-		GenerarQuiz domain.QuizResultado `json:"generarQuiz"`
-	}
-	vars := map[string]any{
-		"sesionId":   sesionID,
 		"ramoCodigo": ramoCodigo,
+		"desde":      desde.UTC().Format(time.RFC3339),
+		"hasta":      hasta.UTC().Format(time.RFC3339),
 	}
 	err := c.ejecutarGraphQL(ctx, query, vars, &out)
-	return out.GenerarQuiz, err
+	return out.BuscarDisponibilidad, err
 }
 
-// --- 2. Adaptador Mock en memoria (para desarrollo y pruebas sin depender de otros servicios) ---
-
-type MockBFFClient struct {
-	mu             sync.RWMutex
-	tutores        []domain.TutorResumen
-	disponibilidad []domain.BloqueDisponibilidad
-	reservas       []domain.ReservaCreada
-	contadorID     int
-}
-
-func NewMockBFFClient() *MockBFFClient {
-	return &MockBFFClient{
-		tutores: []domain.TutorResumen{
-			{
-				ID:     "11111111-1111-1111-1111-111111111111",
-				Nombre: "Camila Rojas",
-				Email:  "camila.rojas@ucn.cl",
-				Ramos:  []string{"MAT1610", "MAT1620"},
-			},
-			{
-				ID:     "22222222-2222-2222-2222-222222222222",
-				Nombre: "Matías Vega",
-				Email:  "matias.vega@ucn.cl",
-				Ramos:  []string{"MAT1620", "IIC1103", "IIC2133"},
-			},
-			{
-				ID:     "33333333-3333-3333-3333-333333333333",
-				Nombre: "Sofía Morales",
-				Email:  "sofia.morales@ucn.cl",
-				Ramos:  []string{"FIS1514", "MAT1610"},
-			},
-		},
-		disponibilidad: []domain.BloqueDisponibilidad{
-			{ID: "disp-1", TutorID: "11111111-1111-1111-1111-111111111111", Dia: "jueves", HoraIni: "15:00", HoraFin: "16:30"},
-			{ID: "disp-2", TutorID: "11111111-1111-1111-1111-111111111111", Dia: "viernes", HoraIni: "10:00", HoraFin: "11:30"},
-			{ID: "disp-3", TutorID: "22222222-2222-2222-2222-222222222222", Dia: "jueves", HoraIni: "17:00", HoraFin: "18:30"},
-			{ID: "disp-4", TutorID: "33333333-3333-3333-3333-333333333333", Dia: "martes", HoraIni: "14:00", HoraFin: "15:30"},
-		},
-	}
-}
-
-func (m *MockBFFClient) BuscarTutores(_ context.Context, ramoCodigo string) ([]domain.TutorResumen, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var resultado []domain.TutorResumen
-	for _, t := range m.tutores {
-		for _, r := range t.Ramos {
-			if strings.EqualFold(r, ramoCodigo) {
-				resultado = append(resultado, t)
-				break
+func (c *HTTPBFFClient) VerDisponibilidad(ctx context.Context, tutorID string, desde, hasta time.Time) ([]domain.BloqueDisponibilidad, error) {
+	const query = `
+		query VerDisponibilidad($tutorId: ID!, $desde: DateTime!, $hasta: DateTime!) {
+			disponibilidad(tutorId: $tutorId, desde: $desde, hasta: $hasta) {
+				id
+				tutorId
+				ramoCodigo
+				inicio
+				fin
+				libre
 			}
-		}
+		}`
+	var out struct {
+		Disponibilidad []domain.BloqueDisponibilidad `json:"disponibilidad"`
 	}
-	return resultado, nil
+	vars := map[string]any{
+		"tutorId": tutorID,
+		"desde":   desde.UTC().Format(time.RFC3339),
+		"hasta":   hasta.UTC().Format(time.RFC3339),
+	}
+	err := c.ejecutarGraphQL(ctx, query, vars, &out)
+	return out.Disponibilidad, err
 }
 
-func (m *MockBFFClient) VerDisponibilidad(_ context.Context, tutorID, dia string) ([]domain.BloqueDisponibilidad, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var resultado []domain.BloqueDisponibilidad
-	for _, b := range m.disponibilidad {
-		if b.TutorID != tutorID {
-			continue
-		}
-		if dia != "" && !strings.EqualFold(b.Dia, dia) {
-			continue
-		}
-		resultado = append(resultado, b)
+// CrearReserva invoca la mutación crearSesion del BFF exigiendo el JWT en Authorization.
+func (c *HTTPBFFClient) CrearReserva(ctx context.Context, tutorID, _ string, ramoCodigo string, inicio time.Time) (domain.ReservaCreada, error) {
+	if domain.AuthTokenDesdeContexto(ctx) == "" {
+		return domain.ReservaCreada{}, fmt.Errorf("%w: falta la cabecera Authorization para crear la reserva", domain.ErrServicioExterno)
 	}
-	return resultado, nil
-}
 
-func (m *MockBFFClient) CrearReserva(_ context.Context, tutorID, estudianteID, ramoCodigo, horario string) (domain.ReservaCreada, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.contadorID++
-	reserva := domain.ReservaCreada{
-		SesionID:     fmt.Sprintf("sesion-mock-%d", m.contadorID),
-		TutorID:      tutorID,
-		EstudianteID: estudianteID,
-		RamoCodigo:   ramoCodigo,
-		Estado:       "PENDIENTE",
-		CreadaEn:     time.Now().UTC(),
+	const mutation = `
+		mutation CrearSesion($input: CrearSesionInput!) {
+			crearSesion(input: $input) {
+				id
+				tutorId
+				estudianteId
+				ramoCodigo
+				inicio
+				fin
+				estado
+				creadaEn
+			}
+		}`
+	var out struct {
+		CrearSesion domain.ReservaCreada `json:"crearSesion"`
 	}
-	m.reservas = append(m.reservas, reserva)
-	return reserva, nil
-}
-
-func (m *MockBFFClient) GenerarQuiz(_ context.Context, _ string, ramoCodigo string) (domain.QuizResultado, error) {
-	return domain.QuizResultado{
-		RamoCodigo: ramoCodigo,
-		Preguntas: []domain.PreguntaQuiz{
-			{
-				Pregunta:          fmt.Sprintf("¿Cuál es el concepto fundamental evaluado en la unidad 1 de %s?", ramoCodigo),
-				Opciones:          []string{"A) Teorema Fundamental", "B) Integración por partes", "C) Series convergentes", "D) Límites laterales"},
-				RespuestaCorrecta: "A) Teorema Fundamental",
-			},
-			{
-				Pregunta:          fmt.Sprintf("Al resolver problemas de %s, ¿qué verificación se recomienda realizar primero?", ramoCodigo),
-				Opciones:          []string{"A) Validar dominio y condiciones iniciales", "B) Ignorar restricciones", "C) Derivar sin simplificar", "D) Redondear al entero"},
-				RespuestaCorrecta: "A) Validar dominio y condiciones iniciales",
-			},
+	vars := map[string]any{
+		"input": map[string]any{
+			"tutorId":    tutorID,
+			"ramoCodigo": ramoCodigo,
+			"inicio":     inicio.UTC().Format(time.RFC3339),
 		},
-	}, nil
+	}
+	err := c.ejecutarGraphQL(ctx, mutation, vars, &out)
+	return out.CrearSesion, err
 }

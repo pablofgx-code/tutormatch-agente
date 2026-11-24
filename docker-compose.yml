@@ -5,14 +5,14 @@ services:
       dockerfile: Dockerfile
     container_name: tutormatch-agente
     ports:
-      - "${PORT:-8080}:8080"
+      - "${PORT:-8081}:8081"
     environment:
-      PORT: "8080"
+      PORT: "8081"
       GEMINI_API_KEY: "${GEMINI_API_KEY}"
       GEMINI_MODEL: "${GEMINI_MODEL:-gemini-flash-lite-latest}"
       BFF_URL: "${BFF_URL:-}"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
       interval: 15s
       timeout: 5s
       retries: 3
