@@ -5,6 +5,8 @@ metadata:
   labels:
     app: agente
 spec:
+  # Obligatorio 1 réplica: el historial de conversaciones vive en memoria (LRU+TTL)
+  # y se pierde al reiniciar. Escalar a >1 réplica requiere migrar ConversationStore a Redis.
   replicas: 1
   selector:
     matchLabels:
@@ -64,6 +66,8 @@ metadata:
   labels:
     app: agente
 spec:
+  # Uso estrictamente interno (ClusterIP): NO exponer hacia fuera del clúster
+  # porque /mcp identifica al usuario mediante la cabecera X-Usuario-Id sin verificar JWT.
   type: ClusterIP
   selector:
     app: agente

@@ -57,3 +57,4 @@ Crea primero el Secret con tu clave y luego aplica el manifiesto:
 kubectl create secret generic agente-secrets --from-literal=gemini-api-key="TU_CLAVE_AQUI"
 kubectl apply -f k8s/deployment.yaml
 ```
+> **Restricciones de despliegue:** El Deployment debe mantenerse con **`replicas: 1`** porque el historial de conversaciones vive en memoria (se pierde al reiniciar el pod; escalar a múltiples réplicas requiere un store compartido como Redis). El Service es **`ClusterIP` interno** y nunca debe exponerse fuera del clúster, ya que `/mcp` lee `X-Usuario-Id` directamente.
